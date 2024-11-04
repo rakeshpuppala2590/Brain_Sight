@@ -1,15 +1,16 @@
 import streamlit as st
 import tensorflow as tf
-from tensorflow.keras.applications import Xception
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
-from tensorflow.keras.models import Model
+from tensorflow.keras.models import load_model as tf_load_model
 import numpy as np
 import matplotlib.pyplot as plt
 from tf_keras_vis.saliency import Saliency
 from tf_keras_vis.utils import normalize
 import os
-import time
-import cv2
+import google.generativeai as genai
+from PIL import Image
+import io
+import html
+import re
 
 # Set up image parameters
 IMG_HEIGHT, IMG_WIDTH = 224, 224
@@ -18,187 +19,274 @@ BATCH_SIZE = 32
 # Set up class names
 CLASS_NAMES = ['glioma_tumor', 'meningioma_tumor', 'no_tumor', 'pituitary_tumor']
 
-# Set up paths for your dataset
-TRAIN_DIR = '/Users/rakeshpuppala/Desktop/Brain_Sight/archive/Training/'
-TEST_DIR = '/Users/rakeshpuppala/Desktop/Brain_Sight/archive/Testing'
+# Define model paths
+XCEPTION_MODEL_PATH = 'models/xception_brain_tumor.h5'
+CUSTOM_CNN_MODEL_PATH = 'models/custom_cnn_brain_tumor.h5'
 
-def create_model():
-    base_model = Xception(weights='imagenet', include_top=False, input_shape=(IMG_HEIGHT, IMG_WIDTH, 3))
-    x = base_model.output
-    x = GlobalAveragePooling2D()(x)
-    x = Dense(1024, activation='relu')(x)
-    predictions = Dense(len(CLASS_NAMES), activation='softmax')(x)
-    model = Model(inputs=base_model.input, outputs=predictions)
-    
-    for layer in base_model.layers:
-        layer.trainable = False
-    
-    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-    return model
+def sanitize_text(text):
+    """Sanitize text to prevent invalid characters in HTML/XML"""
+    if not isinstance(text, str):
+        text = str(text)
+    # Remove non-printable characters
+    text = ''.join(char for char in text if char.isprintable())
+    # Escape HTML special characters
+    text = html.escape(text)
+    # Remove any remaining control characters
+    text = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', text)
+    return text
 
-def preprocess_image(image_path, label):
-    image = tf.io.read_file(image_path)
-    image = tf.image.decode_jpeg(image, channels=3)
-    image = tf.image.resize(image, [IMG_HEIGHT, IMG_WIDTH])
-    image = image / 255.0  # Normalize the image
-    label = tf.one_hot(label, depth=len(CLASS_NAMES))  # One-hot encode the label
-    return image, label
-
-def create_dataset(data_dir):
-    image_paths = []
-    labels = []
-    for class_name in CLASS_NAMES:
-        class_path = os.path.join(data_dir, class_name)
-        for image_name in os.listdir(class_path):
-            image_paths.append(os.path.join(class_path, image_name))
-            labels.append(CLASS_NAMES.index(class_name))
-    
-    dataset = tf.data.Dataset.from_tensor_slices((image_paths, labels))
-    dataset = dataset.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.shuffle(buffer_size=len(image_paths)).batch(BATCH_SIZE)
-    dataset = dataset.repeat()  # Add repeat to prevent running out of data
-    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-    return dataset, len(image_paths)
-
-def train_model(model):
-    train_dataset, train_size = create_dataset(TRAIN_DIR)
-    val_dataset, val_size = create_dataset(TEST_DIR)
-    
-    # Verify datasets
-    if train_size == 0 or val_size == 0:
-        st.error("Error: One or both datasets are empty.")
-        return model, None
-    
-    steps_per_epoch = train_size // BATCH_SIZE
-    validation_steps = val_size // BATCH_SIZE
-
+def safe_markdown(content):
+    """Safely render markdown content"""
     try:
-        history = model.fit(
-            train_dataset,
-            epochs=10,
-            validation_data=val_dataset,
-            steps_per_epoch=steps_per_epoch,
-            validation_steps=validation_steps
-        )
+        sanitized_content = sanitize_text(content)
+        st.markdown(sanitized_content, unsafe_allow_html=True)
     except Exception as e:
-        st.error(f"An error occurred during training: {str(e)}")
-        return model, None
+        st.error(f"Error rendering content: {str(e)}")
+        st.text(content)  # Fallback to plain text
 
-    return model, history
-
-@st.cache_resource
-def load_model(model_choice):
+def initialize_gemini():
+    """Initialize Gemini with error handling"""
     try:
-        if model_choice == "Transfer Learning - Xception":
-            model = create_model()
-            model, history = train_model(model)
-        elif model_choice == "Custom CNN":
-            model = create_custom_cnn()
-            # Optionally train the custom CNN here or load pre-trained weights.
-            # model, history = train_model(model)
-        else:
-            st.error("Invalid model choice.")
-            return None
-        
+        genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+        model = genai.GenerativeModel('gemini-1.5-pro')
         return model
     except Exception as e:
-        st.error(f"Error in load_model: {str(e)}")
+        st.error(f"Error initializing Gemini: {str(e)}")
+        return None
+
+def get_explanation(gemini_model, image_array, predicted_class, confidence):
+    """Get concise AI explanation with 4 key observation points"""
+    try:
+        if gemini_model is None:
+            return "Gemini model not initialized"
+
+        # Convert numpy array to PIL Image
+        image = Image.fromarray((image_array[0] * 255).astype(np.uint8))
+        
+        # Ensure image is in RGB mode
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Create generation config with stricter constraints
+        generation_config = genai.types.GenerationConfig(
+            temperature=0.3,
+            top_p=0.8,
+            top_k=40,
+            max_output_tokens=200,
+        )
+
+        # Updated prompt to focus on descriptive observations
+        prompt = f"""
+        Describe the visible features in this brain MRI scan. The AI system detected patterns consistent with {sanitize_text(predicted_class)}.
+        
+        Provide 4 simple observations (one sentence each):
+        1. Describe the prominent visible pattern or area of interest
+        2. Note any distinctive intensity variations
+        3. Describe the location of notable features
+        4. Compare this to typical patterns seen in {sanitize_text(predicted_class)} cases
+        
+        Keep each point purely descriptive and observational. Format as a numbered list with exactly one line per point.
+        Note: This is for research/educational purposes only.
+        """
+
+        # Create content parts
+        content_parts = [prompt, image]
+
+        try:
+            response = gemini_model.generate_content(
+                content_parts,
+                generation_config=generation_config,
+                stream=False
+            )
+            
+            if response and response.text:
+                # Clean up the response to ensure exactly 4 lines
+                lines = response.text.strip().split('\n')
+                formatted_lines = []
+                line_count = 0
+                for line in lines:
+                    if line.strip() and line_count < 4:
+                        formatted_lines.append(line.strip())
+                        line_count += 1
+                
+                # If we got fewer than 4 lines, add placeholder lines
+                while len(formatted_lines) < 4:
+                    formatted_lines.append(f"{len(formatted_lines) + 1}. Feature observation unavailable")
+                
+                # Join only the first 4 lines
+                return '\n'.join(formatted_lines[:4])
+            else:
+                return "No explanation generated"
+                
+        except Exception as api_error:
+            return f"Error from Gemini API: {str(api_error)}"
+        
+    except Exception as e:
+        return f"Error preparing explanation: {str(e)}"
+@st.cache_resource
+def load_model(model_choice):
+    """Load the model with enhanced error handling"""
+    try:
+        model_path = XCEPTION_MODEL_PATH if model_choice == "Transfer Learning - Xception" else CUSTOM_CNN_MODEL_PATH
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+            
+        model = tf_load_model(model_path)
+        return model
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}")
         return None
 
 def generate_saliency_map(model, image):
-    # Ensure model_modifier passes the model's output correctly
-    saliency = Saliency(model, model_modifier=lambda m: m)
-    saliency_map = saliency(score_function, image)
-    saliency_map = normalize(saliency_map)
-    return saliency_map[0]
+    """Generate saliency map with error handling"""
+    try:
+        saliency = Saliency(model, model_modifier=lambda m: m)
+        saliency_map = saliency(lambda x: x[:, tf.argmax(x[0])], image)
+        return normalize(saliency_map)[0]
+    except Exception as e:
+        st.error(f"Error generating saliency map: {str(e)}")
+        return None
 
-def score_function(output):
-    return output[:, tf.argmax(output[0])]
+def display_results(predicted_class, confidence):
+    """Display classification results using Streamlit components"""
+    st.markdown("""
+        <style>
+        .result-box {
+            padding: 20px;
+            background-color: #f9f9f9;
+            border: 2px solid #ccc;
+            border-radius: 10px;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .result-title {
+            color: #ff6347;
+            font-size: 24px;
+            margin-bottom: 15px;
+        }
+        .result-content {
+            color: #4CAF50;
+            font-size: 20px;
+            margin: 10px 0;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
-def create_custom_cnn():
-    model = tf.keras.Sequential([
-        tf.keras.layers.Conv2D(32, (3, 3), activation='relu', input_shape=(IMG_HEIGHT, IMG_WIDTH, 3)),
-        tf.keras.layers.MaxPooling2D(pool_size=(2, 2)),
-        tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
-        tf.keras.layers.MaxPooling2D(pool_size=(2, 2)),
-        tf.keras.layers.Conv2D(128, (3, 3), activation='relu'),
-        tf.keras.layers.MaxPooling2D(pool_size=(2, 2)),
-        tf.keras.layers.Flatten(),
-        tf.keras.layers.Dense(128, activation='relu'),
-        tf.keras.layers.Dense(len(CLASS_NAMES), activation='softmax')
-    ])
-    
-    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-    return model
+    st.markdown(f"""
+        <div class="result-box">
+            <h2 class="result-title">Classification Result</h2>
+            <h3 class="result-content">
+                Predicted Class: <strong>{predicted_class}</strong>
+            </h3>
+            <h3 class="result-content">
+                Confidence: <strong>{confidence:.2f}</strong>
+            </h3>
+        </div>
+    """, unsafe_allow_html=True)
+
+def display_explanation(explanation):
+    """Display AI-generated explanation using Streamlit components"""
+    st.markdown("""
+        <style>
+        .explanation-box {
+            padding: 20px;
+            background-color: #f0f8ff;
+            border: 2px solid #4682b4;
+            border-radius: 10px;
+            margin-top: 20px;
+        }
+        .explanation-title {
+            color: #4682b4;
+            font-size: 22px;
+            margin-bottom: 15px;
+        }
+        .explanation-content {
+            font-size: 16px;
+            line-height: 1.6;
+            color: #333;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown(f"""
+        <div class="explanation-box">
+            <h2 class="explanation-title">AI-Generated Medical Explanation</h2>
+            <div class="explanation-content">
+                {explanation}
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
 
 def main():
-    st.title("Brain Tumor MRI Classification")
+    st.title("Brain Tumor MRI Classification with AI Explanation")
 
-    st.sidebar.title("Select Model")
+    # Initialize Gemini model
+    gemini_model = initialize_gemini()
+
+    # Model selection
     model_choice = st.sidebar.radio("Choose a model:", ("Transfer Learning - Xception", "Custom CNN"))
-
-    model = load_model(model_choice)  # Pass the model_choice to load_model
+    model = load_model(model_choice)
+    
     if model is None:
-        st.error("Failed to load the model. Please check the logs for details.")
+        st.error("Please ensure the model files are present in the models directory")
         return
 
+    # File upload
     uploaded_file = st.file_uploader("Choose a brain MRI image...", type=["jpg", "jpeg", "png"])
+    
     if uploaded_file is not None:
-        image = tf.image.decode_image(uploaded_file.read(), channels=3)
-        image = tf.image.resize(image, [IMG_HEIGHT, IMG_WIDTH])
-        image = image / 255.0  # Normalize the image
-        image = np.expand_dims(image, axis=0)
+        try:
+            # Process image
+            image_bytes = uploaded_file.read()
+            image = tf.image.decode_image(image_bytes, channels=3)
+            image = tf.image.resize(image, [IMG_HEIGHT, IMG_WIDTH])
+            image_normalized = image / 255.0
+            image_batch = np.expand_dims(image_normalized, axis=0)
 
-        with st.spinner('Classifying image...'):
-            prediction = model.predict(image)
-        predicted_class = CLASS_NAMES[np.argmax(prediction)]
-        confidence = np.max(prediction)
+            # Make prediction
+            with st.spinner('Classifying image...'):
+                prediction = model.predict(image_batch)
+            predicted_class = CLASS_NAMES[np.argmax(prediction)]
+            confidence = np.max(prediction)
 
-        col1, col2 = st.columns(2)
-
-        fixed_width = 300  # Define a fixed width for the images
-        fixed_height = 300  # Define a fixed height for consistency
-
-        with col1:
-            st.image(uploaded_file, caption="Uploaded MRI Scan", use_column_width=False, width=fixed_width)
+            # Display images
+            col1, col2 = st.columns(2)
+            with col1:
+                st.image(image_bytes, caption="Uploaded MRI Scan", width=300)
             
-        with col2:
-            with st.spinner('Generating saliency map...'):
-                saliency_map = generate_saliency_map(model, image)
-            
-            # Resize the saliency map to the same dimensions
-            fig, ax = plt.subplots(figsize=(fixed_width / 100, fixed_height / 100))  # Adjust the figure size in inches
-            ax.imshow(saliency_map, cmap='jet')
-            ax.axis('off')  # Hide the axes
+            with col2:
+                saliency_map = generate_saliency_map(model, image_batch)
+                if saliency_map is not None:
+                    fig, ax = plt.subplots(figsize=(3, 3))
+                    ax.imshow(saliency_map, cmap='jet')
+                    ax.axis('off')
+                    st.pyplot(fig)
+                    st.caption("Saliency Map")
+
+            # Display classification results using the new function
+            display_results(predicted_class, confidence)
+
+            # Generate and display AI explanation
+            if gemini_model:
+                with st.spinner('Generating AI explanation...'):
+                    explanation = get_explanation(gemini_model, image_batch, predicted_class, confidence)
+                    display_explanation(explanation)
+
+            # Display confidence metrics
+            st.subheader("Confidence Level")
+            st.progress(float(confidence))
+
+            # Display class probabilities
+            st.subheader("Class Probabilities")
+            fig, ax = plt.subplots()
+            ax.barh(CLASS_NAMES, prediction[0])
+            ax.set_xlim([0, 1])
+            ax.set_xlabel('Probability')
             st.pyplot(fig)
-            st.caption("Saliency Map")
 
-        # Display classification result inside a styled box
-        st.markdown(
-            f"""
-            <div style="padding: 20px; background-color: #f9f9f9; border: 2px solid #ccc; border-radius: 10px; text-align: center;">
-                <h2 style="color: #ff6347;">Classification Result</h2>
-                <h3 style="font-size: 24px; color: #4CAF50;">Predicted Class: <strong>{predicted_class}</strong></h3>
-                <h3 style="font-size: 24px; color: #4CAF50;">Confidence: <strong>{confidence:.2f}</strong></h3>
-            </div>
-            """, unsafe_allow_html=True
-        )
-
-        # Simulate a progress bar for confidence level
-        st.subheader("Confidence Level")
-        progress = st.progress(0)  # Initialize the progress bar at 0
-        for percent_complete in range(int(confidence * 100) + 1):
-            progress.progress(percent_complete / 100)  # Fill up the progress bar according to confidence level
-            time.sleep(0.02)  # Slow down the animation for effect
-
-        st.subheader("Class Probabilities")
-        colors = ['red', 'green', 'blue', 'orange']  # Define different colors for each class
-        fig, ax = plt.subplots()
-        ax.barh(CLASS_NAMES, prediction[0], color=colors)  # Horizontal bar graph with custom colors
-        ax.set_xlim([0, 1])  # Set the limit to make sure it's between 0 and 1 (probabilities)
-        ax.set_xlabel('Probability')
-        ax.set_title('Class Probabilities')
-        st.pyplot(fig)
+        except Exception as e:
+            st.error(f"Error processing image: {str(e)}")
 
 if __name__ == "__main__":
     main()
