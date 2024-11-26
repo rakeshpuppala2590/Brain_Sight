@@ -13,6 +13,12 @@ import html
 import re
 
 #testing_pull_request_review_agent
+IMG_HEIGHT1, IMG_WIDTH1= 224, 224
+BATCH_SIZE1 = 32
+
+# Set up class names
+CLASS_NAMES1 = ['glioma_tumor', 'meningioma_tumor', 'no_tumor', 'pituitary_tumor']
+
 
 # Set up image parameters
 IMG_HEIGHT, IMG_WIDTH = 224, 224
